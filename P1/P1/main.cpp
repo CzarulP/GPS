@@ -19,6 +19,8 @@
 #include <cmath>
 #include <string>
 #include <algorithm>
+#include <cstdlib>
+#include <ctime>
 
 
 // stb_image - header-only, define implementation in ONE .cpp file
@@ -32,7 +34,13 @@ const float PI    = 3.14159265f;
  
 // Shadow map resolution
 const int SHADOW_W = 4096, SHADOW_H = 4096;
- 
+
+// Random float in [a, b]
+float randf(float a, float b)
+{
+    return a + (b - a) * ((float)rand() / (float)RAND_MAX);
+}
+
 // ═════════════════════════════════════════════
 //  STRUCTS
 // ═════════════════════════════════════════════
@@ -73,6 +81,26 @@ struct Car {
     }
 };
  
+// An object that drifts with a random walk and bounces off invisible bounds
+struct RandomMover {
+    glm::vec3 position;
+    glm::vec3 velocity;
+    glm::vec3 color;
+    float     radius;
+};
+
+// An object that follows a deterministic rule: an elliptical orbit at
+// constant angular speed. Position/heading are recomputed each frame from time.
+struct RuleMover {
+    float     a, b;          // ellipse semi-axes (X and Z)
+    float     height;        // constant Y
+    float     speed;         // angular speed (rad/s); negative = clockwise
+    float     angleOffset;   // starting phase (rad)
+    glm::vec3 color;
+    glm::vec3 position;      // computed each frame
+    float     yaw;           // computed heading (degrees) so the body faces travel
+};
+
 // Camera modes
 enum CameraMode { CAM_FREE, CAM_FOLLOW, CAM_TOP };
  
@@ -93,6 +121,8 @@ float deltaTime = 0.f, lastFrame = 0.f;
 CameraMode camMode = CAM_FOLLOW;
 Car        car;
 std::vector<StaticObject> objects;
+std::vector<RandomMover>  randomMovers;
+std::vector<RuleMover>    ruleMovers;
  
 bool keyStates[1024] = {false};
 bool collisionOccurred = false;
@@ -348,7 +378,7 @@ Mesh buildGround(float halfSize)
     std::vector<float> v = {
         -halfSize, 0, -halfSize,  0,0,  0,1,0,
          halfSize, 0, -halfSize,  1,0,  0,1,0,
-         halfSize, 0,  halfSize,  1,1,  0,1,0,
+         halfSize, 0,  halfSize,  1,1,  0,1,0, 
         -halfSize, 0,  halfSize,  0,1,  0,1,0,
     };
     std::vector<unsigned int> idx = {0,2,1, 0,3,2};
@@ -435,7 +465,38 @@ Mesh buildCone(int segments, float radius, float height)
     }
     return buildMesh(v, idx);
 }
- 
+
+// UV sphere (for the drifting orbs). Winding is outward-facing so it survives
+// back-face culling.
+Mesh buildSphere(int stacks, int slices, float radius)
+{
+    std::vector<float> v;
+    std::vector<unsigned int> idx;
+    for(int i = 0; i <= stacks; i++){
+        float phi = PI * (float)i / stacks;   // 0..PI, from +Y pole down
+        float y   = cosf(phi);
+        float r   = sinf(phi);
+        for(int j = 0; j <= slices; j++){
+            float theta = 2.f * PI * (float)j / slices;
+            float x = r * cosf(theta);
+            float z = r * sinf(theta);
+            float u = (float)j / slices;
+            float w = (float)i / stacks;
+            // pos(3) uv(2) norm(3); on a unit sphere the position is the normal
+            v.insert(v.end(), {x*radius, y*radius, z*radius, u, w, x, y, z});
+        }
+    }
+    int stride = slices + 1;
+    for(int i = 0; i < stacks; i++){
+        for(int j = 0; j < slices; j++){
+            unsigned int a = i * stride + j;
+            unsigned int b = a + stride;
+            idx.insert(idx.end(), {a, a+1, b,  a+1, b+1, b});
+        }
+    }
+    return buildMesh(v, idx);
+}
+
 // Oval track (a ring of quads)
 Mesh buildOvalTrack(float outerA, float outerB, float innerA, float innerB, int segments)
 {
@@ -664,6 +725,12 @@ bool aabbOverlap(const AABB& a, const AABB& b)
            (a.min.y <= b.max.y && a.max.y >= b.min.y) &&
            (a.min.z <= b.max.z && a.max.z >= b.min.z);
 }
+
+// AABB enclosing a sphere (for orb collisions)
+AABB sphereAABB(const glm::vec3& c, float r)
+{
+    return { c - glm::vec3(r), c + glm::vec3(r) };
+}
  
 // ═════════════════════════════════════════════
 //  SCENE SETUP: STATIC OBJECTS
@@ -732,6 +799,71 @@ void setupObjects()
         objects.push_back(o);
     }
 }
+
+// ═════════════════════════════════════════════
+//  SCENE SETUP: MOVING OBJECTS
+// ═════════════════════════════════════════════
+void setupMovers()
+{
+    // ── RANDOM MOVERS ── drifting glowing orbs (random walk + bounce)
+    glm::vec3 orbColors[] = {
+        {1.0f, 0.9f, 0.3f}, {0.3f, 0.9f, 1.0f}, {1.0f, 0.4f, 0.7f},
+        {0.5f, 1.0f, 0.4f}, {1.0f, 0.6f, 0.2f}, {0.7f, 0.5f, 1.0f},
+    };
+    for(int i = 0; i < 8; i++){
+        RandomMover m;
+        m.position = glm::vec3(randf(-30.f, 30.f), randf(1.f, 6.f), randf(-30.f, 30.f));
+        m.velocity = glm::vec3(randf(-3.f, 3.f), randf(-2.f, 2.f), randf(-3.f, 3.f));
+        m.color    = orbColors[i % 6];
+        m.radius   = randf(0.3f, 0.6f);
+        randomMovers.push_back(m);
+    }
+
+    // ── RULE MOVERS ── shuttles on deterministic elliptical orbits
+    struct { float a, b, h, spd, off; glm::vec3 col; } defs[] = {
+        {19.5f, 13.5f, 0.6f,  0.6f, 0.f,  {0.1f, 0.4f, 0.9f}}, // on the track
+        {19.5f, 13.5f, 0.6f,  0.6f, PI,   {0.9f, 0.5f, 0.1f}}, // opposite side, same lane
+        {30.0f, 26.0f, 8.0f,  0.3f, 1.0f, {0.8f, 0.1f, 0.8f}}, // wide high orbit
+        {12.0f, 12.0f, 6.0f, -0.9f, 2.0f, {0.1f, 0.9f, 0.6f}}, // tight reverse orbit
+    };
+    for(auto& d : defs){
+        RuleMover m;
+        m.a = d.a; m.b = d.b; m.height = d.h;
+        m.speed = d.spd; m.angleOffset = d.off; m.color = d.col;
+        m.position = glm::vec3(0.f); m.yaw = 0.f;
+        ruleMovers.push_back(m);
+    }
+}
+
+// Random walk: nudge velocity each frame, clamp speed, bounce off bounds.
+void updateRandomMovers(float dt)
+{
+    const glm::vec3 lo(-35.f, 0.6f, -35.f), hi(35.f, 7.f, 35.f);
+    const float maxSpeed = 6.f;
+    for(auto& m : randomMovers){
+        m.velocity += glm::vec3(randf(-1.f, 1.f), randf(-1.f, 1.f), randf(-1.f, 1.f)) * (8.f * dt);
+        float sp = glm::length(m.velocity);
+        if(sp > maxSpeed) m.velocity *= maxSpeed / sp;
+        m.position += m.velocity * dt;
+        for(int k = 0; k < 3; k++){
+            if(m.position[k] < lo[k]){ m.position[k] = lo[k]; m.velocity[k] =  fabs(m.velocity[k]); }
+            if(m.position[k] > hi[k]){ m.position[k] = hi[k]; m.velocity[k] = -fabs(m.velocity[k]); }
+        }
+    }
+}
+
+// Defined rule: position on an ellipse parameterised by time; heading follows
+// the path's tangent so the shuttle always faces its direction of travel.
+void updateRuleMovers(float t)
+{
+    for(auto& m : ruleMovers){
+        float ang = m.angleOffset + m.speed * t;
+        m.position = glm::vec3(cosf(ang) * m.a, m.height, sinf(ang) * m.b);
+        glm::vec3 dir(-sinf(ang) * m.a, 0.f, cosf(ang) * m.b); // tangent (dPos/dang)
+        if(m.speed < 0.f) dir = -dir;                          // face actual travel
+        m.yaw = glm::degrees(atan2f(dir.x, dir.z));
+    }
+}
  
 // ═════════════════════════════════════════════
 //  INPUT
@@ -790,7 +922,7 @@ void setModelAndDraw(GLuint prog, const glm::mat4& model, Mesh& mesh)
  
 // Draw all scene geometry (called for both shadow pass and main pass)
 void drawScene(GLuint prog, Mesh& ground, Mesh& track, Mesh& box,
-               Mesh& cylinder, Mesh& cone, Mesh& carBody,
+               Mesh& cylinder, Mesh& cone, Mesh& sphere, Mesh& carBody,
                GLuint texGrass, GLuint texAsphalt, GLuint texBuilding,
                bool isShadowPass)
 {
@@ -872,6 +1004,27 @@ void drawScene(GLuint prog, Mesh& ground, Mesh& track, Mesh& box,
         }
     }
  
+    // ── RANDOM MOVERS (drifting glowing orbs) ──
+    if(!isShadowPass)
+        glUniform1i(glGetUniformLocation(prog, "useTexture"), 0);
+    for(auto& m : randomMovers){
+        if(!isShadowPass)
+            glUniform3f(glGetUniformLocation(prog, "objectColor"), m.color.r, m.color.g, m.color.b);
+        model = glm::translate(glm::mat4(1.f), m.position);
+        model = glm::scale(model, glm::vec3(m.radius));
+        setModelAndDraw(prog, model, sphere);
+    }
+
+    // ── RULE MOVERS (shuttles on elliptical orbits) ──
+    for(auto& m : ruleMovers){
+        if(!isShadowPass)
+            glUniform3f(glGetUniformLocation(prog, "objectColor"), m.color.r, m.color.g, m.color.b);
+        model = glm::translate(glm::mat4(1.f), m.position);
+        model = glm::rotate(model, glm::radians(m.yaw), glm::vec3(0, 1, 0));
+        model = glm::scale(model, glm::vec3(0.8f, 0.6f, 1.6f));
+        setModelAndDraw(prog, model, box);
+    }
+
     // ── CAR ──
     if(!isShadowPass){
         glUniform1i(glGetUniformLocation(prog, "useTexture"), 0);
@@ -931,6 +1084,8 @@ void drawScene(GLuint prog, Mesh& ground, Mesh& track, Mesh& box,
 // ═════════════════════════════════════════════
 int main()
 {
+    srand((unsigned)time(nullptr));
+
     // ── GLFW ──
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -973,6 +1128,7 @@ int main()
     Mesh box      = buildBox();
     Mesh cyl      = buildCylinder(16, 0.5f, 1.f); // unit cylinder, scaled per use
     Mesh cone     = buildCone(16, 0.5f, 1.f);
+    Mesh sphere   = buildSphere(16, 24, 1.f); // unit sphere, scaled per use
     Mesh quad2D   = buildQuad2D();
     Mesh skyFaces[6];
     for(int i=0;i<6;i++) skyFaces[i] = buildSkyFace(i, 80.f);
@@ -982,6 +1138,7 @@ int main()
  
     // ── Scene objects ──
     setupObjects();
+    setupMovers();
  
     // ── Light ──
     glm::vec3 lightDir = glm::normalize(glm::vec3(-0.5f, -1.f, -0.3f));
@@ -993,7 +1150,9 @@ int main()
               << "  2 : Follow camera (behind car)\n"
               << "  3 : Top-down camera\n"
               << "  Scroll : zoom\n"
-              << "  ESC : quit\n";
+              << "  ESC : quit\n"
+              << "  Scene also has drifting orbs (random motion) and\n"
+              << "  shuttles orbiting on fixed elliptical paths (rule-based).\n";
  
     // ── Render loop ──
     while(!glfwWindowShouldClose(window))
@@ -1026,27 +1185,46 @@ int main()
         glm::vec3 moveDir(-sinf(rad), 0, -cosf(rad));
         glm::vec3 newPos = car.position + moveDir * car.speed * deltaTime;
  
+        // ────── UPDATE MOVING OBJECTS ──────
+        // Updated before collision so the car tests against their current pose.
+        updateRandomMovers(deltaTime); // random walk
+        updateRuleMovers(now);         // deterministic elliptical orbits
+
         // ────── COLLISION DETECTION ──────
         Car testCar = car;
         testCar.position = newPos;
         AABB carBox = testCar.getBBox();
         bool blocked = false;
- 
+
+        // Static scenery (buildings, trees, streetlights)
         for(auto& obj : objects){
-            if(aabbOverlap(carBox, obj.bbox)){
-                blocked = true;
-                collisionOccurred = true;
-                collisionTimer = 0.3f;
-                car.speed *= -0.3f; // bounce back
-                break;
+            if(aabbOverlap(carBox, obj.bbox)){ blocked = true; break; }
+        }
+        // Drifting orbs
+        if(!blocked){
+            for(auto& m : randomMovers){
+                if(aabbOverlap(carBox, sphereAABB(m.position, m.radius))){ blocked = true; break; }
             }
         }
+        // Orbiting shuttles (approx half-extents of the rotated body)
         if(!blocked){
+            const glm::vec3 h(0.85f, 0.3f, 0.85f);
+            for(auto& m : ruleMovers){
+                AABB b = { m.position - h, m.position + h };
+                if(aabbOverlap(carBox, b)){ blocked = true; break; }
+            }
+        }
+
+        if(blocked){
+            collisionOccurred = true;
+            collisionTimer = 0.3f;
+            car.speed *= -0.3f; // bounce back
+        } else {
             car.position = newPos;
         }
- 
+
         if(collisionTimer > 0.f) collisionTimer -= deltaTime;
- 
+
         // ────── UPDATE CAMERA ──────
         if(camMode == CAM_FREE){
             float spd = 10.f * deltaTime;
@@ -1094,7 +1272,7 @@ int main()
         glUniformMatrix4fv(glGetUniformLocation(shadowProg, "lightSpaceMatrix"), 1, GL_FALSE, glm::value_ptr(lightSpaceMat));
         // Cull front faces to reduce peter-panning
         glCullFace(GL_FRONT);
-        drawScene(shadowProg, ground, track, box, cyl, cone, box, texGrass, texAsphalt, texBuilding, true);
+        drawScene(shadowProg, ground, track, box, cyl, cone, sphere, box, texGrass, texAsphalt, texBuilding, true);
         glCullFace(GL_BACK);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
  
@@ -1135,7 +1313,7 @@ int main()
         glActiveTexture(GL_TEXTURE0);
         glUniform1i(glGetUniformLocation(mainProg, "tex"), 0);
  
-        drawScene(mainProg, ground, track, box, cyl, cone, box, texGrass, texAsphalt, texBuilding, false);
+        drawScene(mainProg, ground, track, box, cyl, cone, sphere, box, texGrass, texAsphalt, texBuilding, false);
  
         // ── Skybox ──
         glDepthFunc(GL_LEQUAL);
